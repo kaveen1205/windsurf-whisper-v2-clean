@@ -11,6 +11,7 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
   const [result, setResult] = useState('');
   const [error, setError] = useState<string | null>(null);
 
@@ -28,18 +29,18 @@ export default function Dashboard() {
 
       const formData = new FormData();
       formData.append('file', file);
+      formData.append('language', 'auto');
+      // Highest accuracy: use default server settings (no fast mode)
 
-      console.log('[Dashboard] Sending request to http://localhost:8081/transcribe');
-      const response = await fetch('http://localhost:8081/transcribe', {
+      console.log('[Dashboard] Sending request to http://localhost:8081/transcribe-start');
+      const startRes = await fetch('http://localhost:8081/transcribe-start', {
         method: 'POST',
         body: formData,
       });
 
-      console.log('[Dashboard] /transcribe status:', response.status);
-
-      if (!response.ok) {
-        const raw = await response.text().catch(() => '');
-        let message = 'Transcription failed. Please try again.';
+      if (!startRes.ok) {
+        const raw = await startRes.text().catch(() => '');
+        let message = 'Failed to start transcription.';
         if (raw) {
           try {
             const parsed = JSON.parse(raw);
@@ -48,20 +49,54 @@ export default function Dashboard() {
             message = raw;
           }
         }
-        console.error('[Dashboard] /transcribe error body:', raw);
+        console.error('[Dashboard] /transcribe-start error:', raw);
         setError(message);
         return;
       }
 
-      const data = await response.json().catch(() => null);
-      console.log('[Dashboard] /transcribe parsed JSON:', data);
-
-      if (!data || typeof data.text !== 'string') {
-        throw new Error('Unexpected response format from transcription service.');
+      const { job_id } = await startRes.json();
+      if (!job_id) {
+        throw new Error('No job_id returned by server.');
       }
 
-      console.log('[Dashboard] Setting result state');
-      setResult(data.text);
+      // Poll progress
+      setProgress(5);
+      const pollIntervalMs = 700;
+      await new Promise<void>((resolve, reject) => {
+        const id = setInterval(async () => {
+          try {
+            const progRes = await fetch(`http://localhost:8081/transcribe-progress?job_id=${job_id}`);
+            if (!progRes.ok) {
+              const raw = await progRes.text().catch(() => '');
+              throw new Error(raw || 'Progress polling failed');
+            }
+            const prog = await progRes.json();
+            const pct = typeof prog.percent === 'number' ? Math.max(0, Math.min(100, prog.percent)) : 0;
+            setProgress(pct);
+            if (prog.status === 'done' || pct >= 100) {
+              clearInterval(id);
+              const resRes = await fetch(`http://localhost:8081/transcribe-result?job_id=${job_id}`);
+              if (!resRes.ok) {
+                const raw = await resRes.text().catch(() => '');
+                throw new Error(raw || 'Failed to fetch result');
+              }
+              const data = await resRes.json().catch(() => null);
+              if (!data || typeof data.text !== 'string') {
+                throw new Error('Unexpected result format from transcription service.');
+              }
+              setResult(data.text);
+              setProgress(100);
+              resolve();
+            } else if (prog.status === 'error') {
+              clearInterval(id);
+              reject(new Error(prog.message || 'Transcription failed'));
+            }
+          } catch (e: any) {
+            clearInterval(id);
+            reject(e);
+          }
+        }, pollIntervalMs);
+      });
     } catch (err: any) {
       console.error('Transcription error:', err);
       setError(err?.message || 'Something went wrong during transcription.');
@@ -74,6 +109,7 @@ export default function Dashboard() {
     setFile(null);
     setResult('');
     setError(null);
+    setProgress(0);
   };
 
   return (
@@ -134,7 +170,7 @@ export default function Dashboard() {
           <FileUpload
             onFileSelect={handleFileSelect}
             isUploading={loading}
-            uploadProgress={loading ? 50 : 0}
+            uploadProgress={progress}
           />
 
           {error && (

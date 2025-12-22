@@ -4,8 +4,12 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+import re
+import uuid
+import threading
+import time
 
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +19,7 @@ import whisper
 
 
 logger = logging.getLogger("panuval_maatram_backend")
+TA_PROMPT_APPEND = os.getenv("TA_PROMPT_APPEND", "").strip()
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
@@ -42,7 +47,15 @@ def _get_file_extension(filename: str) -> str:
 WHISPER_MODEL = None
 CURRENT_DEVICE = "cpu"
 # Allow override via environment variable; default to a more accurate model
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "large-v2")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "large-v3")
+
+DEFAULT_TA_PROMPT = (
+    "இந்த ஆடியோ முழுவதும் தமிழில் உள்ளது. தமிழ் உச்சரிப்பு, வழக்கு, முறைப்பாடு எல்லாவற்றையும் துல்லியமாகப் பதிவு செய். "
+    "வாக்கிய எல்லைகளை தெளிவாகப் பிரித்து, சரியான நிறுத்தக்குறிகள் (., ?, !) மற்றும் கமா (,) பயன்படுத்தவும். "
+    "தமிழ் எழுத்துருவில் எழுதவும்; ஆங்கிலச் சொற்கள், பெயர்கள், தொழில்நுட்பச் சொற்கள், சுருக்கங்கள் வந்தால் அவற்றை அப்படியே ஆங்கிலத்தில் வைத்திரு (transliteration செய்யாதே). "
+    "தொழில்முறைத் தரத்தில் தெளிவாகவும் சரியான இலக்கணத்துடனும் எழுதவும். பொதுவான பேசுபண்புச் சொற்கள்: "
+    "நாங்க, நீங்க, உங்க, பண்ண, இருக்கே, அப்புறம், இல்ல, இதுல, அதான், ஏன், எப்படி, என்ன, இன்னும், ரொம்ப, கொஞ்சம், சும்மா."
+)
 
 # Terms that indicate GPU or memory-related failures that should trigger CPU fallback
 GPU_ERROR_TERMS = (
@@ -62,6 +75,14 @@ MEMORY_ERROR_TERMS = (
     "cannot allocate memory",
     "killed",
 )
+
+
+# In-memory job tracking for progress/result reporting
+PROGRESS: Dict[str, Dict[str, Any]] = {}
+RESULTS: Dict[str, str] = {}
+ERRORS: Dict[str, str] = {}
+JOB_TMPDIRS: Dict[str, str] = {}
+PROGRESS_LOCK = threading.Lock()
 
 
 @app.on_event("startup")
@@ -238,6 +259,193 @@ def _maybe_convert_to_wav(src_path: str, ext: str) -> str:
         return src_path
 
 
+def _normalize_audio_to_wav(src_path: str) -> str:
+    dst_path = os.path.splitext(src_path)[0] + ".norm.wav"
+    try:
+        logger.info("Normalizing audio to WAV (16kHz mono, loudnorm): %s -> %s", src_path, dst_path)
+        denoise = os.getenv("ENABLE_DENOISE", "0").lower() in {"1", "true", "yes"}
+        filters = []
+        if denoise:
+            filters.append("highpass=f=100")
+            filters.append("afftdn=nf=-25")
+            filters.append("lowpass=f=8000")
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        audio_filters = ",".join(filters)
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-af",
+                audio_filters,
+                dst_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+        logger.info("ffmpeg normalize success. First line: %s", proc.stdout.splitlines()[:1] or proc.stderr.splitlines()[:1])
+        return dst_path
+    except FileNotFoundError:
+        logger.error("FFmpeg not found during normalization; proceeding with original file")
+        return src_path
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("FFmpeg normalization failed, proceeding with original file: %s", exc)
+        return src_path
+
+
+def _postprocess_tamil_text(text: str) -> str:
+    s = text.replace("\u200c", "").replace("\u200d", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r" *([.,!?;:]) *", r"\1 ", s)
+    s = re.sub(r"([.!?]){2,}", r"\1", s)
+    s = re.sub(r"([.!?])(\S)", r"\1 \2", s)
+    s = re.sub(r"\s+\n", "\n", s)
+    s = re.sub(r"\n\s+", "\n", s)
+    return s.strip()
+
+
+def _ffprobe_duration_seconds(path: str) -> Optional[float]:
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+        val = proc.stdout.strip()
+        return float(val) if val else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _set_progress(job_id: str, percent: Optional[int] = None, *, status: Optional[str] = None, message: Optional[str] = None) -> None:
+    with PROGRESS_LOCK:
+        state = PROGRESS.get(job_id) or {"percent": 0, "status": "processing", "message": None}
+        if percent is not None:
+            state["percent"] = max(0, min(100, int(percent)))
+        if status is not None:
+            state["status"] = status
+        if message is not None:
+            state["message"] = message
+        PROGRESS[job_id] = state
+
+
+def _progress_timer(job_id: str, start_percent: int, duration_s: Optional[float]) -> None:
+    if duration_s is None or duration_s <= 0:
+        duration_s = 60.0
+    t0 = time.time()
+    while True:
+        with PROGRESS_LOCK:
+            state = PROGRESS.get(job_id)
+            if not state or state.get("status") != "processing":
+                return
+            current = int(state.get("percent", 0))
+        elapsed = time.time() - t0
+        frac = max(0.0, min(1.0, elapsed / duration_s))
+        target = start_percent + int(frac * (95 - start_percent))
+        if target > current:
+            _set_progress(job_id, target)
+        if target >= 95:
+            time.sleep(0.5)
+            continue
+        time.sleep(0.5)
+
+
+def _cleanup_job(job_id: str) -> None:
+    tmp = JOB_TMPDIRS.pop(job_id, None)
+    if tmp and os.path.isdir(tmp):
+        try:
+            shutil.rmtree(tmp)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to clean job tmp dir: %s", tmp)
+
+
+def _run_transcription_job(job_id: str, tmp_dir: str, tmp_path: str, ext: str, language: Optional[str], initial_prompt: Optional[str], audio_duration: Optional[float], mode: Optional[str]) -> None:
+    try:
+        _set_progress(job_id, 5, status="processing")
+        audio_path = _maybe_convert_to_wav(tmp_path, ext)
+        _set_progress(job_id, 15)
+        fast = (mode or "").strip().lower() in {"fast", "1", "true", "quick", "speed"}
+        if not fast:
+            audio_path = _normalize_audio_to_wav(audio_path)
+        _set_progress(job_id, 20)
+
+        threading.Thread(target=_progress_timer, args=(job_id, 20, audio_duration), daemon=True).start()
+
+        if WHISPER_MODEL is None:
+            ensure_model_loaded()
+        if WHISPER_MODEL is None:
+            _set_progress(job_id, status="error", message="Transcription model not available")
+            return
+
+        lang_norm = (language or "").strip().lower() if language else ""
+        effective_language = None if lang_norm in {"", "auto", "autodetect", "detect"} else language
+        effective_prompt = initial_prompt
+        if not effective_prompt and effective_language == "ta":
+            effective_prompt = DEFAULT_TA_PROMPT
+        if TA_PROMPT_APPEND and effective_language == "ta":
+            effective_prompt = (effective_prompt + " " + TA_PROMPT_APPEND) if effective_prompt else TA_PROMPT_APPEND
+
+        logger.info("[job %s] Whisper transcribe starting (lang=%s, mode=%s)", job_id, effective_language or "auto", ("fast" if fast else "normal"))
+        if fast:
+            result = WHISPER_MODEL.transcribe(
+                audio_path,
+                fp16=(CURRENT_DEVICE == "cuda"),
+                language=effective_language,
+                task="transcribe",
+                beam_size=1,
+                temperature=0.0,
+                condition_on_previous_text=True,
+                initial_prompt=effective_prompt,
+            )
+        else:
+            result = WHISPER_MODEL.transcribe(
+                audio_path,
+                fp16=(CURRENT_DEVICE == "cuda"),
+                language=effective_language,
+                task="transcribe",
+                beam_size=10,
+                temperature=0.0,
+                patience=1,
+                condition_on_previous_text=True,
+                no_speech_threshold=0.3,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.6,
+                initial_prompt=effective_prompt,
+            )
+        text = (result.get("text", "") or "").strip()
+        detected_lang = result.get("language")
+        if (not fast) and ((detected_lang == "ta") or (effective_language == "ta")):
+            text = _postprocess_tamil_text(text)
+
+        RESULTS[job_id] = text
+        _set_progress(job_id, 100, status="done")
+        logger.info("[job %s] Transcription done (lang=%s, chars=%d)", job_id, detected_lang or effective_language or "auto", len(text))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[job %s] Transcription failed: %s", job_id, e)
+        _set_progress(job_id, status="error", message=f"{type(e).__name__}: {e}")
+    finally:
+        _cleanup_job(job_id)
+
+
+
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
@@ -303,28 +511,43 @@ async def transcribe(
             )
 
         audio_path = _maybe_convert_to_wav(tmp_path, ext)
+        audio_path = _normalize_audio_to_wav(audio_path)
         try:
             logger.info("Starting transcription for file: %s (path=%s)", file.filename, audio_path)
-            if language:
-                logger.info("Language override provided by client: %s", language)
+            lang_norm = (language or "").strip().lower() if language else ""
+            effective_language = None if lang_norm in {"", "auto", "autodetect", "detect"} else language
+            if effective_language:
+                logger.info("Language override provided by client: %s", effective_language)
             else:
-                logger.info("No language override provided; Whisper will auto-detect language")
-            if initial_prompt:
-                logger.info("Initial prompt provided (%d chars)", len(initial_prompt))
+                logger.info("No language provided or 'auto' selected; Whisper will auto-detect language")
+            effective_prompt = initial_prompt
+            if not effective_prompt and effective_language == "ta":
+                effective_prompt = DEFAULT_TA_PROMPT
+                logger.info("Applied default Tamil biasing prompt (%d chars)", len(effective_prompt))
+            if TA_PROMPT_APPEND and effective_language == "ta":
+                effective_prompt = (effective_prompt + " " + TA_PROMPT_APPEND) if effective_prompt else TA_PROMPT_APPEND
+                logger.info("Appended TA_PROMPT_APPEND to prompt (%d chars total)", len(effective_prompt))
 
-            # Use beam search for better accuracy (slower).
-            logger.info("Calling Whisper model.transcribe(...), task='transcribe', beam_size=10")
+            # Use beam search for better accuracy with tuned thresholds for Tamil audio.
+            logger.info("Calling Whisper model.transcribe(...), task='transcribe', beam_size=10, patience=1")
             result = WHISPER_MODEL.transcribe(
                 audio_path,
                 fp16=(CURRENT_DEVICE == "cuda"),
-                language=language,  # None => auto-detect
+                language=effective_language,
                 task="transcribe",
                 beam_size=10,
                 temperature=0.0,
-                initial_prompt=initial_prompt,
+                patience=1,
+                condition_on_previous_text=True,
+                no_speech_threshold=0.3,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.6,
+                initial_prompt=effective_prompt,
             )
             text = result.get("text", "").strip()
             detected_lang = result.get("language")
+            if (detected_lang == "ta") or (effective_language == "ta"):
+                text = _postprocess_tamil_text(text)
             if detected_lang:
                 logger.info("Detected language: %s", detected_lang)
         except Exception as e:  # noqa: BLE001
@@ -339,14 +562,21 @@ async def transcribe(
                         result = WHISPER_MODEL.transcribe(
                             audio_path,
                             fp16=(CURRENT_DEVICE == "cuda"),
-                            language=language,
+                            language=effective_language,
                             task="transcribe",
                             beam_size=10,
                             temperature=0.0,
-                            initial_prompt=initial_prompt,
+                            patience=1,
+                            condition_on_previous_text=True,
+                            no_speech_threshold=0.3,
+                            logprob_threshold=-1.0,
+                            compression_ratio_threshold=2.6,
+                            initial_prompt=effective_prompt,
                         )
                         text = result.get("text", "").strip()
                         detected_lang = result.get("language")
+                        if (detected_lang == "ta") or (effective_language == "ta"):
+                            text = _postprocess_tamil_text(text)
                         if detected_lang:
                             logger.info("Detected language (CPU retry): %s", detected_lang)
                     except Exception as e2:  # noqa: BLE001
@@ -393,6 +623,85 @@ async def transcribe(
             shutil.rmtree(tmp_dir)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to remove temporary directory: %s", tmp_dir)
+
+
+@app.post("/transcribe-start")
+async def transcribe_start(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    initial_prompt: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),  # e.g., "fast" for speed-focused decoding
+) -> JSONResponse:
+    logger.info("/transcribe-start called")
+
+    if not file or not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file uploaded.")
+
+    ext = _get_file_extension(file.filename)
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Supported types: mp3, wav, mp4.",
+        )
+
+    tmp_dir = tempfile.mkdtemp(prefix="panuval_maatram_job_")
+    tmp_path = os.path.join(tmp_dir, f"upload{ext}")
+
+    total_bytes = 0
+    with open(tmp_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            buffer.write(chunk)
+    if total_bytes == 0:
+        shutil.rmtree(tmp_dir)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    dur = _ffprobe_duration_seconds(tmp_path)
+    job_id = uuid.uuid4().hex
+    JOB_TMPDIRS[job_id] = tmp_dir
+    PROGRESS[job_id] = {"percent": 0, "status": "processing", "message": None}
+
+    threading.Thread(
+        target=_run_transcription_job,
+        args=(job_id, tmp_dir, tmp_path, ext, language, initial_prompt, dur, mode),
+        daemon=True,
+    ).start()
+
+    logger.info("/transcribe-start created job: %s (duration=%.2fs)", job_id, dur or -1)
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/transcribe-progress")
+def transcribe_progress(job_id: str) -> JSONResponse:
+    state = PROGRESS.get(job_id)
+    if not state:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "percent": int(state.get("percent", 0)),
+            "status": state.get("status", "processing"),
+            "message": state.get("message"),
+        }
+    )
+
+
+@app.get("/transcribe-result")
+def transcribe_result(job_id: str) -> JSONResponse:
+    state = PROGRESS.get(job_id)
+    if not state:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    status_str = state.get("status")
+    if status_str == "done":
+        text = RESULTS.get(job_id, "")
+        return JSONResponse({"text": text})
+    if status_str == "error":
+        msg = state.get("message") or "Transcription failed"
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=msg)
+    return JSONResponse({"status": "processing"}, status_code=status.HTTP_202_ACCEPTED)
 
 
 if __name__ == "__main__":
