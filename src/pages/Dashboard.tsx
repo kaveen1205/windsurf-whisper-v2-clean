@@ -4,7 +4,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { FileUpload } from '@/components/FileUpload';
 import { TranscriptionResult } from '@/components/TranscriptionResult';
-import { Mic, LogOut, Play } from 'lucide-react';
+import { Mic, LogOut, Youtube } from 'lucide-react';
 
 export default function Dashboard() {
   const { user, logout } = useAuth();
@@ -122,6 +122,16 @@ export default function Dashboard() {
             </div>
             <span className="font-display font-semibold text-foreground">Panuval Maatram</span>
           </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => navigate('/youtube')}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <Youtube className="w-4 h-4 mr-2" />
+              YouTube Live
+            </Button>
           
           <Button
             variant="ghost"
@@ -132,6 +142,7 @@ export default function Dashboard() {
             <LogOut className="w-4 h-4 mr-2" />
             Sign out
           </Button>
+          </div>
         </div>
       </header>
 

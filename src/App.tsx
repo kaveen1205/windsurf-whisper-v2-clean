@@ -7,6 +7,7 @@ import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
+import YoutubeLive from "./pages/YoutubeLive";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -55,6 +56,14 @@ const AppRoutes = () => (
       element={
         <ProtectedRoute>
           <Dashboard />
+        </ProtectedRoute>
+      }
+    />
+    <Route
+      path="/youtube"
+      element={
+        <ProtectedRoute>
+          <YoutubeLive />
         </ProtectedRoute>
       }
     />
